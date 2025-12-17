@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from app.core.config import settings
+from app.core.logger import logger
 
 # 全局异步引擎和会话工厂
 _engine: AsyncEngine | None = None
@@ -32,6 +33,16 @@ def get_engine() -> AsyncEngine:
     """
     global _engine
     if _engine is None:
+        # 从 DSN 中提取主机信息用于日志（隐藏密码）
+        dsn_parts = settings.mysql_dsn.split("@")
+        db_host = dsn_parts[1] if len(dsn_parts) > 1 else "unknown"
+
+        logger.info(
+            f"创建数据库引擎 | "
+            f"主机: {db_host} | "
+            f"连接池大小: 10 | 最大溢出: 20"
+        )
+
         _engine = create_async_engine(
             settings.mysql_dsn,
             echo=settings.environment == "development",  # 开发环境打印 SQL
@@ -40,6 +51,8 @@ def get_engine() -> AsyncEngine:
             pool_pre_ping=True,  # 连接前检查是否存活
             pool_recycle=3600,  # 1小时回收连接(避免 MySQL timeout)
         )
+
+        logger.debug("数据库引擎创建成功")
     return _engine
 
 
@@ -98,10 +111,17 @@ async def init_db() -> None:
     """
     from app.db.models import Base
 
-    engine = get_engine()
-    async with engine.begin() as conn:
-        # 创建所有表
-        await conn.run_sync(Base.metadata.create_all)
+    logger.debug("开始初始化数据库表...")
+
+    try:
+        engine = get_engine()
+        async with engine.begin() as conn:
+            # 创建所有表
+            await conn.run_sync(Base.metadata.create_all)
+        logger.info("数据库表初始化成功")
+    except Exception as e:
+        logger.error(f"数据库初始化失败 | 错误: {e}")
+        raise
 
 
 async def close_db() -> None:
@@ -111,7 +131,12 @@ async def close_db() -> None:
     在应用关闭时调用
     """
     global _engine, _async_session_maker
+
     if _engine:
+        logger.debug("正在关闭数据库连接池...")
         await _engine.dispose()
         _engine = None
-    _async_session_maker = None
+        _async_session_maker = None
+        logger.info("数据库连接池已关闭")
+    else:
+        logger.warning("数据库引擎未初始化，无需关闭")

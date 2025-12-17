@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import inspect
 import re
+import time
 import unicodedata
 from collections.abc import AsyncGenerator
 from functools import partial
@@ -14,6 +16,7 @@ from lightrag.rerank import ali_rerank
 from lightrag.utils import EmbeddingFunc
 
 from app.core.config import settings
+from app.core.logger import logger
 
 
 def _sanitize_text_for_embedding(text: str) -> str:
@@ -186,6 +189,14 @@ class LightRAGService:
         workspace = settings.lightrag_workspace_path
         workspace.mkdir(parents=True, exist_ok=True)
 
+        logger.info(
+            f"初始化 LightRAG | "
+            f"工作区: {workspace} | "
+            f"LLM 类型: {settings.llm_type} | "
+            f"LLM 超时: {settings.llm_timeout}s | "
+            f"Embedding 超时: {settings.embedding_timeout}s"
+        )
+
         # 统一的 Embedding 配置 (使用安全包装器防止 NaN 错误)
         embedding_config = EmbeddingFunc(
             embedding_dim=1024,
@@ -198,6 +209,7 @@ class LightRAGService:
 
         # 根据配置选择 LLM
         if settings.llm_type == "ollama":
+            logger.debug(f"使用 Ollama LLM | 模型: {settings.ollama_model}")
             # 使用 Ollama LLM + Ollama Embedding
             self.rag = LightRAG(
                 working_dir=str(workspace),
@@ -213,6 +225,7 @@ class LightRAGService:
                 default_embedding_timeout=settings.embedding_timeout,
             )
         elif settings.llm_type == "openai":
+            logger.debug(f"使用 OpenAI LLM | 模型: {settings.openai_model}")
             # 使用 OpenAI LLM + Ollama Embedding
             self.rag = LightRAG(
                 working_dir=str(workspace),
@@ -223,12 +236,17 @@ class LightRAGService:
                 default_embedding_timeout=settings.embedding_timeout,
             )
         else:
+            logger.error(f"不支持的 LLM 类型: {settings.llm_type}")
             raise ValueError(f"不支持的 LLM 类型: {settings.llm_type}，请使用 'ollama' 或 'openai'")
+
+        logger.info(f"LightRAG 配置完成 | Rerank 启用: {settings.enable_rerank}")
 
     async def initialize(self) -> None:
         """初始化存储"""
+        logger.debug("开始初始化 LightRAG 存储...")
         await self.rag.initialize_storages()
         await initialize_pipeline_status()
+        logger.info("LightRAG 存储初始化完成")
 
     async def insert_document(self, text: str, metadata: dict[str, Any] | None = None) -> None:
         """
@@ -238,46 +256,88 @@ class LightRAGService:
             text: 文档文本内容
             metadata: 文档元数据 (doc_id, filename, filepath)
         """
-        # 清理文本，防止嵌入模型返回 NaN
-        text = _sanitize_text_for_embedding(text)
+        doc_id = metadata.get("doc_id", "unknown") if metadata else "unknown"
+        filename = metadata.get("filename", "unknown") if metadata else "unknown"
 
-        # 将 metadata 存储在文本开头作为特殊标记
-        # 这样可以在后续查询时追溯来源
-        if metadata:
-            doc_id = metadata.get("doc_id")
-            filename = metadata.get("filename", "")
-            # 在文本开头添加元数据标记 (不影响语义理解)
-            text_with_meta = f"[DOC_ID:{doc_id}][FILENAME:{filename}]\n\n{text}"
-            await self.rag.ainsert(text_with_meta)
-        else:
-            await self.rag.ainsert(text)
+        logger.info(
+            f"开始插入文档 | doc_id: {doc_id} | "
+            f"文件名: {filename} | 原始文本长度: {len(text)}"
+        )
+
+        start_time = time.perf_counter()
+
+        try:
+            # 清理文本，防止嵌入模型返回 NaN
+            text = _sanitize_text_for_embedding(text)
+            logger.debug(f"文本清洗完成 | doc_id: {doc_id} | 清洗后长度: {len(text)}")
+
+            # 将 metadata 存储在文本开头作为特殊标记
+            # 这样可以在后续查询时追溯来源
+            if metadata:
+                # 在文本开头添加元数据标记 (不影响语义理解)
+                text_with_meta = f"[DOC_ID:{doc_id}][FILENAME:{filename}]\n\n{text}"
+                await self.rag.ainsert(text_with_meta)
+            else:
+                await self.rag.ainsert(text)
+
+            elapsed_ms = (time.perf_counter() - start_time) * 1000
+            logger.info(f"文档插入成功 | doc_id: {doc_id} | 耗时: {elapsed_ms:.2f}ms")
+
+        except Exception as e:
+            elapsed_ms = (time.perf_counter() - start_time) * 1000
+            logger.error(
+                f"文档插入失败 | doc_id: {doc_id} | "
+                f"耗时: {elapsed_ms:.2f}ms | 错误: {e}"
+            )
+            raise
 
     async def query(self, question: str, mode: str = "hybrid") -> str:
         """
         异步查询,返回字符串结果
         """
-        result = await self.rag.aquery(
-            question,
-            param=QueryParam(mode=mode, stream=False)
-        )
-        return result
+        logger.info(f"RAG 查询开始 | 模式: {mode} | 问题: {question[:100]}...")
+        start_time = time.perf_counter()
+
+        try:
+            result = await self.rag.aquery(
+                question,
+                param=QueryParam(mode=mode, stream=False)
+            )
+            elapsed_ms = (time.perf_counter() - start_time) * 1000
+            logger.info(
+                f"RAG 查询成功 | 模式: {mode} | "
+                f"结果长度: {len(result)} | 耗时: {elapsed_ms:.2f}ms"
+            )
+            return result
+        except Exception as e:
+            elapsed_ms = (time.perf_counter() - start_time) * 1000
+            logger.error(
+                f"RAG 查询失败 | 模式: {mode} | "
+                f"耗时: {elapsed_ms:.2f}ms | 错误: {e}"
+            )
+            raise
 
     async def stream_query(self, question: str, mode: str = "hybrid") -> AsyncGenerator[str, None]:
         """
         异步流式查询,返回异步生成器
         """
+        logger.info(f"RAG 流式查询开始 | 模式: {mode} | 问题: {question[:100]}...")
+
         result = await self.rag.aquery(
             question,
             param=QueryParam(mode=mode, stream=True)
         )
 
+        chunk_count = 0
         # 检查是否是异步生成器
-        import inspect
         if inspect.isasyncgen(result):
             async for chunk in result:
+                chunk_count += 1
                 yield chunk
+            logger.info(f"RAG 流式查询完成 | 模式: {mode} | Chunk 数量: {chunk_count}")
         else:
             # 如果不是流式响应,直接返回
+            logger.debug("RAG 返回非流式响应，直接输出")
             yield str(result)
 
     async def stream_query_with_citations(
@@ -301,16 +361,22 @@ class LightRAGService:
             "is_final": False
         }
         """
+        logger.info(
+            f"RAG 流式查询(带引用)开始 | 模式: {mode} | "
+            f"问题: {question[:100]}..."
+        )
+
         # 先进行流式查询
         result = await self.rag.aquery(
             question,
             param=QueryParam(mode=mode, stream=True)
         )
 
-        import inspect
+        chunk_count = 0
         if inspect.isasyncgen(result):
             # 流式响应
             async for chunk in result:
+                chunk_count += 1
                 # 提取文本中的引用标记
                 citations = self._extract_citations_from_text(chunk)
                 yield {
@@ -325,8 +391,13 @@ class LightRAGService:
                 "citations": [],
                 "is_final": True
             }
+            logger.info(
+                f"RAG 流式查询(带引用)完成 | 模式: {mode} | "
+                f"Chunk 数量: {chunk_count}"
+            )
         else:
             # 非流式响应
+            logger.debug("RAG 返回非流式响应，直接输出")
             text = str(result)
             citations = self._extract_citations_from_text(text)
             yield {
@@ -383,6 +454,8 @@ async def get_rag_service() -> LightRAGService:
     """获取 RAG 服务单例"""
     global _rag_service
     if _rag_service is None:
+        logger.info("首次创建 RAG 服务实例...")
         _rag_service = LightRAGService()
         await _rag_service.initialize()
+        logger.info("RAG 服务实例创建完成")
     return _rag_service

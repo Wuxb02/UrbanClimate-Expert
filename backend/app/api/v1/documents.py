@@ -7,6 +7,7 @@
 - GET /: 获取文档列表(分页)
 """
 import hashlib
+import time
 from pathlib import Path
 
 from fastapi import (
@@ -22,6 +23,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.core.logger import logger
 from app.db import Document, DocumentStatus, get_async_session, get_session_context
 from app.schemas import (
     DocumentListItem,
@@ -87,17 +89,32 @@ async def _process_document_background(doc_id: int, filepath: Path) -> None:
     注意: 状态更新使用独立的数据库会话，确保即使主处理流程
     发生异常（如超时），状态也能正确更新。
     """
+    logger.info(f"后台任务启动 | doc_id: {doc_id} | 文件: {filepath.name}")
+    task_start_time = time.perf_counter()
+
     # 1. 标记为 PROCESSING（使用独立会话）
     if not await _update_document_status(doc_id, DocumentStatus.PROCESSING):
+        logger.error(f"状态更新失败，任务终止 | doc_id: {doc_id}")
         return
+
+    logger.info(f"状态更新: PENDING → PROCESSING | doc_id: {doc_id}")
 
     try:
         # 2. 验证并解析 PDF
+        logger.debug(f"开始 PDF 验证 | doc_id: {doc_id}")
         is_valid, error_msg = validate_pdf(filepath)
         if not is_valid:
             raise ValueError(error_msg)
+        logger.info(f"PDF 验证通过 | doc_id: {doc_id}")
 
+        logger.info(f"开始 PDF 解析 | doc_id: {doc_id}")
+        parse_start = time.perf_counter()
         text = parse_pdf_text(filepath)
+        parse_elapsed = (time.perf_counter() - parse_start) * 1000
+        logger.info(
+            f"PDF 解析完成 | doc_id: {doc_id} | "
+            f"文本长度: {len(text)} | 耗时: {parse_elapsed:.2f}ms"
+        )
 
         if not text or len(text.strip()) < 100:
             raise ValueError("提取的文本过短,可能是无效的 PDF")
@@ -109,10 +126,12 @@ async def _process_document_background(doc_id: int, filepath: Path) -> None:
             )
             doc = result.scalar_one_or_none()
             if not doc:
+                logger.error(f"文档记录不存在 | doc_id: {doc_id}")
                 return
             filename = doc.filename
 
         # 4. 插入 LightRAG
+        logger.info(f"开始插入 LightRAG | doc_id: {doc_id}")
         rag = await get_rag_service()
         await rag.insert_document(
             text=text,
@@ -126,9 +145,21 @@ async def _process_document_background(doc_id: int, filepath: Path) -> None:
         # 5. 标记为 COMPLETED（使用独立会话）
         await _update_document_status(doc_id, DocumentStatus.COMPLETED)
 
+        total_elapsed = (time.perf_counter() - task_start_time) * 1000
+        logger.info(
+            f"文档处理成功 | doc_id: {doc_id} | "
+            f"状态: COMPLETED | 总耗时: {total_elapsed:.2f}ms"
+        )
+
     except Exception as e:
         # 6. 标记为 FAILED（使用独立会话）
         await _update_document_status(doc_id, DocumentStatus.FAILED, str(e))
+
+        total_elapsed = (time.perf_counter() - task_start_time) * 1000
+        logger.error(
+            f"文档处理失败 | doc_id: {doc_id} | "
+            f"状态: FAILED | 总耗时: {total_elapsed:.2f}ms | 错误: {e}"
+        )
 
 
 @router.post(
@@ -148,8 +179,11 @@ async def upload_document(
     - 自动去重(基于 SHA256)
     - 返回 202 Accepted,后台异步处理
     """
+    logger.info(f"接收文档上传请求 | 文件名: {file.filename}")
+
     # 1. 验证文件类型
     if not file.filename or not file.filename.lower().endswith(".pdf"):
+        logger.warning(f"文件类型验证失败 | 文件名: {file.filename}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail="仅支持 PDF 文件"
         )
@@ -157,29 +191,41 @@ async def upload_document(
     # 2. 读取文件内容
     content = await file.read()
     filesize = len(content)
+    logger.debug(f"文件读取完成 | 大小: {filesize / 1024:.2f} KB")
 
     # 验证文件大小
     max_size = settings.max_file_size_mb * 1024 * 1024
     if filesize > max_size:
+        logger.warning(
+            f"文件大小超限 | 文件名: {file.filename} | "
+            f"大小: {filesize / 1024 / 1024:.2f} MB | 限制: {settings.max_file_size_mb} MB"
+        )
         raise HTTPException(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
             detail=f"文件大小超过限制({settings.max_file_size_mb}MB)",
         )
 
     if filesize == 0:
+        logger.warning(f"文件为空 | 文件名: {file.filename}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail="文件为空"
         )
 
     # 3. 计算 SHA256 哈希
     sha256 = _calculate_sha256(content)
+    logger.debug(f"文件哈希计算完成 | SHA256: {sha256[:16]}...")
 
     # 4. 检查是否已存在
     result = await db.execute(select(Document).where(Document.sha256 == sha256))
     existing_doc = result.scalar_one_or_none()
     if existing_doc:
+        logger.warning(
+            f"检测到重复文档 | SHA256: {sha256[:16]}... | "
+            f"现有 doc_id: {existing_doc.id} | 状态: {existing_doc.status}"
+        )
         # 如果文档处理失败,允许重新处理
         if existing_doc.status == DocumentStatus.FAILED:
+            logger.info(f"重新触发失败文档处理 | doc_id: {existing_doc.id}")
             existing_doc.status = DocumentStatus.PENDING
             existing_doc.error_message = None  # 清除之前的错误信息
             await db.commit()
@@ -200,6 +246,7 @@ async def upload_document(
     # 6. 保存文件(使用 SHA256 作为文件名,避免冲突)
     filepath = upload_dir / f"{sha256}.pdf"
     filepath.write_bytes(content)
+    logger.info(f"文件保存成功 | 路径: {filepath}")
 
     # 7. 创建数据库记录
     doc = Document(
@@ -213,8 +260,14 @@ async def upload_document(
     await db.commit()
     await db.refresh(doc)
 
+    logger.info(
+        f"文档记录创建成功 | doc_id: {doc.id} | "
+        f"文件名: {file.filename} | 大小: {filesize / 1024:.2f} KB"
+    )
+
     # 8. 触发后台处理任务
     background_tasks.add_task(_process_document_background, doc.id, filepath)
+    logger.info(f"后台处理任务已触发 | doc_id: {doc.id}")
 
     return DocumentUploadResponse.model_validate(doc)
 

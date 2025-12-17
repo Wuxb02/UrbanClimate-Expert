@@ -12,6 +12,7 @@ import networkx as nx
 from fastapi import APIRouter
 
 from app.core.config import settings
+from app.core.logger import logger
 
 router = APIRouter(prefix="/graph", tags=["graph"])
 
@@ -27,11 +28,24 @@ async def query_graph(q: str = "") -> dict[str, list[dict[str, Any]]]:
     Returns:
         包含 nodes 和 edges 的字典
     """
+    logger.info(f"接收图谱查询请求 | 关键词: '{q or '(全部)'}'")
+
     graph_file = settings.lightrag_workspace_path / "graph_chunk_entity_relation.graphml"
     if not graph_file.exists():
+        logger.warning(f"图谱文件不存在 | 路径: {graph_file}")
         return {"nodes": [], "edges": []}
 
-    graph = nx.read_graphml(graph_file)
+    try:
+        graph = nx.read_graphml(graph_file)
+        logger.debug(
+            f"图谱文件加载成功 | "
+            f"总节点数: {graph.number_of_nodes()} | "
+            f"总边数: {graph.number_of_edges()}"
+        )
+    except Exception as e:
+        logger.error(f"图谱文件加载失败 | 路径: {graph_file} | 错误: {e}")
+        return {"nodes": [], "edges": []}
+
     nodes = []
 
     for node_id, data in graph.nodes(data=True):
@@ -67,5 +81,10 @@ async def query_graph(q: str = "") -> dict[str, list[dict[str, Any]]]:
                 "target": target,
                 "relation": data.get("description", "related_to"),
             })
+
+    logger.info(
+        f"图谱查询完成 | 关键词: '{q or '(全部)'}' | "
+        f"匹配节点数: {len(nodes)} | 相关边数: {len(edges)}"
+    )
 
     return {"nodes": nodes, "edges": edges}

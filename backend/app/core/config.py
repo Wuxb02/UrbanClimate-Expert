@@ -7,6 +7,12 @@ class Settings(BaseSettings):
     app_name: str = "UrbanClimate-Expert"
     environment: str = "development"
 
+    # 日志配置
+    log_level: str = "INFO"
+    log_dir: str = "./logs"
+    log_rotation: str = "00:00"  # 每天午夜轮转
+    log_retention: str = "30 days"
+
     # LLM configuration
     llm_type: str = "ollama"
     ollama_base_url: str = "http://localhost:11434/v1"
