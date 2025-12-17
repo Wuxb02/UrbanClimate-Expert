@@ -1,0 +1,115 @@
+// 全局样式 - UrbanClimate-Expert
+
+// ========== CSS Reset ==========
+*,
+*::before,
+*::after {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+}
+
+html,
+body {
+    height: 100%;
+    font-family: 'Helvetica Neue', Helvetica, 'PingFang SC', 'Hiragino Sans GB',
+        'Microsoft YaHei', '微软雅黑', Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    background-color: #f5f7fa;
+}
+
+#app {
+    height: 100%;
+}
+
+// ========== 滚动条美化 ==========
+::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+}
+
+::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+    background: #c0c4cc;
+    border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background: #909399;
+}
+
+// ========== Element Plus 覆盖 ==========
+.el-menu--horizontal {
+    border-bottom: none !important;
+}
+
+.el-header {
+    padding: 0;
+}
+
+// ========== KaTeX 公式样式 ==========
+.katex {
+    font-size: 1.1em;
+}
+
+.katex-display {
+    overflow-x: auto;
+    padding: 8px 0;
+}
+
+// ========== 代码高亮样式 ==========
+.hljs {
+    background: #1e1e1e !important;
+    border-radius: 6px;
+    padding: 12px !important;
+}
+
+pre {
+    margin: 12px 0;
+    overflow-x: auto;
+
+    code {
+        font-family: 'Fira Code', 'Source Code Pro', Consolas, Monaco, monospace;
+        font-size: 14px;
+        line-height: 1.5;
+    }
+}
+
+// ========== 链接样式 ==========
+a {
+    color: #409eff;
+    text-decoration: none;
+
+    &:hover {
+        text-decoration: underline;
+    }
+}
+
+// ========== 通用工具类 ==========
+.text-center {
+    text-align: center;
+}
+
+.text-muted {
+    color: #909399;
+}
+
+.mt-1 {
+    margin-top: 8px;
+}
+
+.mt-2 {
+    margin-top: 16px;
+}
+
+.mb-1 {
+    margin-bottom: 8px;
+}
+
+.mb-2 {
+    margin-bottom: 16px;
+}
