@@ -23,8 +23,7 @@
   <a href="#技术架构">技术架构</a> •
   <a href="#快速开始">快速开始</a> •
   <a href="#项目结构">项目结构</a> •
-  <a href="#开发指南">开发指南</a> •
-  <a href="#文档">文档</a>
+  <a href="#开发指南">开发指南</a>
 </p>
 
 ---
@@ -238,13 +237,6 @@ urban_climate_expert/
 │   │   └── types/             # TypeScript 类型定义
 │   └── package.json           # Node.js 依赖
 │
-├── docs/                      # 完整文档体系
-│   ├── phases/                # 开发阶段概览
-│   ├── guides/                # 实施指南
-│   ├── api/                   # API 文档
-│   ├── architecture/          # 架构设计
-│   └── setup/                 # 环境配置指南
-│
 ├── docker-compose.yml         # Docker 容器编排
 └── README.md                  # 项目说明
 ```
@@ -289,18 +281,6 @@ pytest tests/ -v
 cd frontend
 npm run test
 ```
-
----
-
-## 📖 文档
-
-详细文档位于 `docs/` 目录：
-
-- [📋 文档导航中心](docs/README.md)
-- [🔧 环境配置指南](docs/setup/ENVIRONMENT_SETUP.md)
-- [📡 API 契约定义](docs/api/API_CONTRACTS.md)
-- [🗄️ 数据库设计](docs/architecture/DATABASE_SCHEMA.md)
-- [❓ 常见问题 FAQ](docs/troubleshooting/COMMON_ISSUES.md)
 
 ---
 
