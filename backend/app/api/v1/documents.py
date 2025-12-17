@@ -40,65 +40,95 @@ def _calculate_sha256(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 
 
+async def _update_document_status(
+    doc_id: int,
+    status: DocumentStatus,
+    error_message: str | None = None,
+) -> bool:
+    """
+    使用独立会话更新文档状态
+
+    Args:
+        doc_id: 文档 ID
+        status: 目标状态
+        error_message: 错误信息（仅在 FAILED 状态时使用）
+
+    Returns:
+        True 表示更新成功，False 表示更新失败
+    """
+    try:
+        async with get_session_context() as db:
+            result = await db.execute(
+                select(Document).where(Document.id == doc_id)
+            )
+            doc = result.scalar_one_or_none()
+            if doc:
+                doc.status = status
+                if error_message is not None:
+                    doc.error_message = error_message[:1000]
+                await db.commit()
+                return True
+            return False
+    except Exception:
+        return False
+
+
 async def _process_document_background(doc_id: int, filepath: Path) -> None:
     """
     后台任务:处理文档
 
     处理流程:
-    1. 标记状态为 PROCESSING
+    1. 标记状态为 PROCESSING（使用独立会话）
     2. 验证并解析 PDF
     3. 插入 LightRAG
-    4. 更新状态为 COMPLETED
-    5. 异常时标记 FAILED
+    4. 更新状态为 COMPLETED（使用独立会话）
+    5. 异常时标记 FAILED（使用独立会话）
+
+    注意: 状态更新使用独立的数据库会话，确保即使主处理流程
+    发生异常（如超时），状态也能正确更新。
     """
-    async with get_session_context() as db:
-        try:
-            # 1. 更新状态为 PROCESSING
+    # 1. 标记为 PROCESSING（使用独立会话）
+    if not await _update_document_status(doc_id, DocumentStatus.PROCESSING):
+        return
+
+    try:
+        # 2. 验证并解析 PDF
+        is_valid, error_msg = validate_pdf(filepath)
+        if not is_valid:
+            raise ValueError(error_msg)
+
+        text = parse_pdf_text(filepath)
+
+        if not text or len(text.strip()) < 100:
+            raise ValueError("提取的文本过短,可能是无效的 PDF")
+
+        # 3. 获取文档信息用于 metadata
+        async with get_session_context() as db:
             result = await db.execute(
                 select(Document).where(Document.id == doc_id)
             )
             doc = result.scalar_one_or_none()
             if not doc:
                 return
+            filename = doc.filename
 
-            doc.status = DocumentStatus.PROCESSING
-            await db.commit()
+        # 4. 插入 LightRAG
+        rag = await get_rag_service()
+        await rag.insert_document(
+            text=text,
+            metadata={
+                "doc_id": doc_id,
+                "filename": filename,
+                "filepath": str(filepath),
+            },
+        )
 
-            # 2. 验证并解析 PDF
-            is_valid, error_msg = validate_pdf(filepath)
-            if not is_valid:
-                raise ValueError(error_msg)
+        # 5. 标记为 COMPLETED（使用独立会话）
+        await _update_document_status(doc_id, DocumentStatus.COMPLETED)
 
-            text = parse_pdf_text(filepath)
-
-            if not text or len(text.strip()) < 100:
-                raise ValueError("提取的文本过短,可能是无效的 PDF")
-
-            # 3. 插入 LightRAG
-            rag = await get_rag_service()
-            await rag.insert_document(
-                text=text,
-                metadata={
-                    "doc_id": doc_id,
-                    "filename": doc.filename,
-                    "filepath": str(filepath),
-                },
-            )
-
-            # 4. 更新状态为 COMPLETED
-            doc.status = DocumentStatus.COMPLETED
-            await db.commit()
-
-        except Exception as e:
-            # 5. 异常处理:标记 FAILED
-            result = await db.execute(
-                select(Document).where(Document.id == doc_id)
-            )
-            doc = result.scalar_one_or_none()
-            if doc:
-                doc.status = DocumentStatus.FAILED
-                doc.error_message = str(e)[:1000]  # 限制错误信息长度
-                await db.commit()
+    except Exception as e:
+        # 6. 标记为 FAILED（使用独立会话）
+        await _update_document_status(doc_id, DocumentStatus.FAILED, str(e))
 
 
 @router.post(
