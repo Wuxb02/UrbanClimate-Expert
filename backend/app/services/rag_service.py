@@ -23,12 +23,84 @@ from app.core.config import settings
 from app.core.logger import logger
 
 
+def _remove_references_section(text: str) -> str:
+    """
+    移除学术论文的参考文献部分，保留附录
+
+    策略：找到 References 标题，然后找到下一个章节标题，只删除中间部分
+    """
+    # 参考文献标题模式
+    ref_patterns = [
+        r'\n\s*#{0,3}\s*References?\s*\n',
+        r'\n\s*#{0,3}\s*REFERENCES?\s*\n',
+        r'\n\s*#{0,3}\s*Bibliography\s*\n',
+        r'\n\s*#{0,3}\s*参考文献\s*\n',
+        r'\n\s*#{0,3}\s*Works\s+Cited\s*\n',
+        r'\n\s*\d+\.?\s*References?\s*\n',
+        r'\n\s*\d+\.?\s*REFERENCES?\s*\n',
+    ]
+
+    # 参考文献之后可能出现的章节标题（附录、致谢等）
+    next_section_patterns = [
+        r'\n\s*#{0,3}\s*Appendix',
+        r'\n\s*#{0,3}\s*APPENDIX',
+        r'\n\s*#{0,3}\s*Supplementary',
+        r'\n\s*#{0,3}\s*SUPPLEMENTARY',
+        r'\n\s*#{0,3}\s*Acknowledgment',
+        r'\n\s*#{0,3}\s*ACKNOWLEDGMENT',
+        r'\n\s*#{0,3}\s*附录',
+        r'\n\s*#{0,3}\s*致谢',
+        r'\n\s*#{0,3}\s*Supporting\s+Information',
+        r'\n\s*[A-Z]\.\s+',  # 附录编号如 "A. xxx"
+        r'\n\s*Appendix\s+[A-Z]',
+    ]
+
+    # 1. 找到 References 的位置
+    ref_start = None
+    for pattern in ref_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            if ref_start is None or match.start() < ref_start:
+                ref_start = match.start()
+
+    if ref_start is None:
+        # 没找到参考文献部分
+        return text
+
+    # 2. 在 References 之后找下一个章节
+    text_after_ref = text[ref_start + 1:]  # +1 跳过换行符
+    ref_end = len(text)  # 默认到文档末尾
+
+    for pattern in next_section_patterns:
+        match = re.search(pattern, text_after_ref, re.IGNORECASE)
+        if match:
+            candidate_end = ref_start + 1 + match.start()
+            if candidate_end < ref_end:
+                ref_end = candidate_end
+
+    # 3. 删除 References 部分，拼接前后内容
+    before_ref = text[:ref_start].rstrip()
+    after_ref = text[ref_end:].lstrip() if ref_end < len(text) else ""
+
+    # 记录日志
+    removed_chars = ref_end - ref_start
+    logger.debug(f"移除参考文献部分 | 删除字符数: {removed_chars}")
+
+    if after_ref:
+        return before_ref + "\n\n" + after_ref
+    else:
+        return before_ref + "\n"
+
+
 def _sanitize_text_for_embedding(text: str) -> str:
     """
     清理可能导致嵌入模型返回 NaN 的文本
 
     bge-m3 模型在处理某些 Unicode 字符时会返回 NaN，需要彻底清理
     """
+    # 0. 首先移除参考文献部分（学术论文），保留附录
+    text = _remove_references_section(text)
+
     # 1. Unicode 规范化 (NFKC: 兼容分解后再规范组合)
     # 这会将特殊字符转换为兼容形式，如 ² → 2, ∗ → *
     text = unicodedata.normalize('NFKC', text)
@@ -136,6 +208,22 @@ def _sanitize_text_for_embedding(text: str) -> str:
     return text.strip()
 
 
+# 用于跟踪已记录 NaN 警告的 doc_id，避免重复日志
+_nan_warning_logged_docs: set[str] = set()
+
+
+def _extract_doc_id_from_text(text: str) -> str | None:
+    """从文本中提取 [DOC_ID:xxx] 标记"""
+    match = re.search(r'\[DOC_ID:([^\]]+)\]', text)
+    return match.group(1) if match else None
+
+
+def reset_nan_warning_tracker() -> None:
+    """重置 NaN 警告跟踪器（在新文档处理开始时调用）"""
+    global _nan_warning_logged_docs
+    _nan_warning_logged_docs.clear()
+
+
 async def _safe_ollama_embed(texts: list[str], **kwargs) -> list[list[float]]:
     """
     安全的 Ollama 嵌入函数包装器 (熔断防御版)
@@ -144,6 +232,8 @@ async def _safe_ollama_embed(texts: list[str], **kwargs) -> list[list[float]]:
     2. 捕获 Ollama 服务端因 NaN 导致的 500 崩溃
     3. 返回零向量兜底，防止整个 Pipeline 失败
     """
+    global _nan_warning_logged_docs
+
     # 1. 清理所有文本
     cleaned_texts = [_sanitize_text_for_embedding(t) for t in texts]
 
@@ -160,11 +250,26 @@ async def _safe_ollama_embed(texts: list[str], **kwargs) -> list[list[float]]:
         error_str = str(e)
         # 检查是否是 NaN 导致的 JSON 编码错误
         if "NaN" in error_str or "500" in error_str or "json" in error_str.lower():
-            print(f" Embedding API 崩溃 (Input: '{cleaned_texts[0][:20]}...，返回全零向量，跳过此坏点。'): {error_str}")
+            # 尝试从文本中提取 doc_id，每个 doc_id 只记录一次警告
+            doc_id = None
+            for text in texts:
+                doc_id = _extract_doc_id_from_text(text)
+                if doc_id:
+                    break
+
+            # 如果找不到 doc_id，使用文本前缀作为标识
+            log_key = doc_id if doc_id else cleaned_texts[0][:50]
+
+            if log_key not in _nan_warning_logged_docs:
+                _nan_warning_logged_docs.add(log_key)
+                logger.warning(
+                    f"Embedding NaN 错误 | doc_id: {doc_id or 'unknown'} | "
+                    f"返回零向量兜底"
+                )
+
             # 返回 1024 维度的零向量 (对应 bge-m3)
-            # LightRAG 传入的是 list，必须返回对应长度的 list[list]
             return [[0.0] * 1024 for _ in range(len(texts))]
-        
+
         # 如果是其他错误（如网络断连），继续抛出
         raise e
 
@@ -325,6 +430,9 @@ class LightRAGService:
             f"开始插入文档 | doc_id: {doc_id} | "
             f"文件名: {filename} | 原始文本长度: {len(text)}"
         )
+
+        # 重置 NaN 警告跟踪器，确保每个文档的警告只记录一次
+        reset_nan_warning_tracker()
 
         start_time = time.perf_counter()
 
