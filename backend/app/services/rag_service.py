@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import inspect
+import json
 import re
 import time
 import unicodedata
 from collections.abc import AsyncGenerator
 from functools import partial
+from pathlib import Path
 from typing import Any
+
+import numpy as np
 
 from lightrag import LightRAG, QueryParam
 from lightrag.kg.shared_storage import initialize_pipeline_status
@@ -134,19 +138,35 @@ def _sanitize_text_for_embedding(text: str) -> str:
 
 async def _safe_ollama_embed(texts: list[str], **kwargs) -> list[list[float]]:
     """
-    安全的 Ollama 嵌入函数包装器
+    安全的 Ollama 嵌入函数包装器 (熔断防御版)
 
-    在调用 ollama_embed 之前清理文本，防止 NaN 错误
+    1. 清理文本
+    2. 捕获 Ollama 服务端因 NaN 导致的 500 崩溃
+    3. 返回零向量兜底，防止整个 Pipeline 失败
     """
-    # 清理所有文本
+    # 1. 清理所有文本
     cleaned_texts = [_sanitize_text_for_embedding(t) for t in texts]
 
-    # 调用原始嵌入函数
-    return await ollama_embed(
-        cleaned_texts,
-        embed_model="bge-m3:latest",
-        host=settings.ollama_base_url.replace("/v1", ""),
-    )
+    try:
+        # 2. 尝试调用 API
+        # 注意: 如果模型算出 NaN, 这里会直接抛出 ResponseError (Status 500)
+        return await ollama_embed(
+            cleaned_texts,
+            embed_model="bge-m3:567m",
+            host=settings.ollama_base_url.replace("/v1", ""),
+        )
+    except Exception as e:
+        # 3. 捕获严重的崩溃异常
+        error_str = str(e)
+        # 检查是否是 NaN 导致的 JSON 编码错误
+        if "NaN" in error_str or "500" in error_str or "json" in error_str.lower():
+            print(f" Embedding API 崩溃 (Input: '{cleaned_texts[0][:20]}...，返回全零向量，跳过此坏点。'): {error_str}")
+            # 返回 1024 维度的零向量 (对应 bge-m3)
+            # LightRAG 传入的是 list，必须返回对应长度的 list[list]
+            return [[0.0] * 1024 for _ in range(len(texts))]
+        
+        # 如果是其他错误（如网络断连），继续抛出
+        raise e
 
 
 async def _openai_llm_func(
@@ -248,6 +268,48 @@ class LightRAGService:
         await initialize_pipeline_status()
         logger.info("LightRAG 存储初始化完成")
 
+    def _check_lightrag_doc_status(
+        self, doc_id: int | str, filename: str
+    ) -> dict | None:
+        """
+        检查 LightRAG 内部特定文档的处理状态
+
+        通过匹配 content_summary 中的 [DOC_ID:x][FILENAME:xxx] 标记
+        来确定是当前插入的文档
+
+        Args:
+            doc_id: 文档 ID
+            filename: 文件名
+
+        Returns:
+            如果该文档处理失败，返回状态信息；否则返回 None
+        """
+        status_file = Path(self.rag.working_dir) / "kv_store_doc_status.json"
+        if not status_file.exists():
+            return None
+
+        try:
+            with open(status_file, 'r', encoding='utf-8') as f:
+                doc_statuses = json.load(f)
+
+            # 查找匹配当前文档的记录
+            target_marker = f"[DOC_ID:{doc_id}][FILENAME:{filename}]"
+
+            for lightrag_doc_id, status_info in doc_statuses.items():
+                content_summary = status_info.get("content_summary", "")
+                if target_marker in content_summary:
+                    if status_info.get("status") == "failed":
+                        return status_info
+                    # 找到了文档但状态不是 failed，说明成功
+                    return None
+
+            # 没找到匹配的文档记录（可能是首次插入时文件还未创建）
+            return None
+
+        except Exception as e:
+            logger.warning(f"读取 LightRAG 状态文件失败: {e}")
+            return None
+
     async def insert_document(self, text: str, metadata: dict[str, Any] | None = None) -> None:
         """
         异步插入文档到 LightRAG
@@ -279,6 +341,13 @@ class LightRAGService:
                 await self.rag.ainsert(text_with_meta)
             else:
                 await self.rag.ainsert(text)
+
+            # 验证插入是否成功：检查 LightRAG 内部状态
+            # LightRAG 的 ainsert() 可能静默失败（只打印日志不抛出异常）
+            failed_doc = self._check_lightrag_doc_status(doc_id, filename)
+            if failed_doc:
+                error_msg = failed_doc.get("error_msg", "未知错误")
+                raise RuntimeError(f"LightRAG 文档处理失败: {error_msg}")
 
             elapsed_ms = (time.perf_counter() - start_time) * 1000
             logger.info(f"文档插入成功 | doc_id: {doc_id} | 耗时: {elapsed_ms:.2f}ms")
