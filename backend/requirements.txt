@@ -9,5 +9,4 @@ SQLAlchemy[asyncio]>=2.0.32
 aiomysql>=0.2.0
 networkx>=3.3
 python-multipart>=0.0.9
-mineru[core]>=2.0.6
 loguru>=0.7.0

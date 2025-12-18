@@ -56,6 +56,15 @@ class Settings(BaseSettings):
     max_file_size_mb: int = 100
     allowed_extensions: list[str] = [".pdf"]
 
+    # MinerU 在线 API 配置
+    mineru_api_url: str = "https://mineru.net/api/v4"  # MinerU API 端点
+    mineru_api_key: str | None = "eyJ0eXBlIjoiSldUIiwiYWxnIjoiSFM1MTIifQ.eyJqdGkiOiI5ODkwMDk2OCIsInJvbCI6IlJPTEVfUkVHSVNURVIiLCJpc3MiOiJPcGVuWExhYiIsImlhdCI6MTc2NjA1NzkwMCwiY2xpZW50SWQiOiJsa3pkeDU3bnZ5MjJqa3BxOXgydyIsInBob25lIjoiIiwib3BlbklkIjpudWxsLCJ1dWlkIjoiODBhM2NhNjMtMzEzOC00MGMyLTkzN2EtZGI5NzRhNDljNjI0IiwiZW1haWwiOiIiLCJleHAiOjE3NjcyNjc1MDB9.ZqqiPR5qJhC2iXkeav2Jo5cAFA7dYiNhRfgtwdyefrwIogfODuD8s7xCtCV6MNrwCf5KaZrDGgxd1SaMXlgEMQ"  # API Key（从 mineru.net 获取）
+    mineru_api_timeout: int = 300  # 单次 HTTP 请求超时时间（秒）
+    mineru_max_retries: int = 3  # 最大重试次数
+    mineru_retry_delay: float = 2.0  # 重试间隔（秒）
+    mineru_poll_interval: float = 5.0  # 任务状态轮询间隔（秒）
+    mineru_max_poll_time: int = 600  # 任务轮询最大等待时间（秒），PDF 解析可能较慢
+
     @property
     def upload_dir_path(self) -> Path:
         """将 upload_dir 转换为绝对路径"""

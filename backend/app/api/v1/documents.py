@@ -31,7 +31,7 @@ from app.schemas import (
     DocumentStatusResponse,
     DocumentUploadResponse,
 )
-from app.services.parser_service import parse_pdf_text, validate_pdf
+from app.services.parser_service import get_parser_service, validate_pdf
 from app.services.rag_service import get_rag_service
 
 router = APIRouter(prefix="/documents", tags=["documents"])
@@ -40,6 +40,36 @@ router = APIRouter(prefix="/documents", tags=["documents"])
 def _calculate_sha256(content: bytes) -> str:
     """计算文件 SHA256 哈希"""
     return hashlib.sha256(content).hexdigest()
+
+
+async def _save_parsed_text(doc_id: int, filename_stem: str, text: str) -> None:
+    """
+    保存 PDF 解析结果（Markdown 格式）
+
+    保存文件：{doc_id}_{filename}.md - 清洗后的 Markdown 文本
+
+    保存位置: backend/parsed_texts/
+    """
+    try:
+        # 创建保存目录
+        parsed_dir = settings.upload_dir_path.parent / "parsed_texts"
+        parsed_dir.mkdir(parents=True, exist_ok=True)
+
+        # 文件名前缀
+        prefix = f"{doc_id}_{filename_stem[:50]}"  # 限制文件名长度
+
+        # 保存 Markdown 文件
+        md_file = parsed_dir / f"{prefix}.md"
+        md_file.write_text(text, encoding="utf-8")
+
+        logger.info(
+            f"解析结果已保存 | doc_id: {doc_id} | "
+            f"长度: {len(text)} 字符 | 文件: {md_file.name}"
+        )
+
+    except Exception as e:
+        # 保存失败不影响主流程
+        logger.warning(f"保存解析结果失败 | doc_id: {doc_id} | 错误: {e}")
 
 
 async def _update_document_status(
@@ -109,7 +139,8 @@ async def _process_document_background(doc_id: int, filepath: Path) -> None:
 
         logger.info(f"开始 PDF 解析 | doc_id: {doc_id}")
         parse_start = time.perf_counter()
-        text = parse_pdf_text(filepath)
+        parser = get_parser_service()
+        text = await parser.parse_pdf(filepath)
         parse_elapsed = (time.perf_counter() - parse_start) * 1000
         logger.info(
             f"PDF 解析完成 | doc_id: {doc_id} | "
@@ -118,6 +149,9 @@ async def _process_document_background(doc_id: int, filepath: Path) -> None:
 
         if not text or len(text.strip()) < 100:
             raise ValueError("提取的文本过短,可能是无效的 PDF")
+
+        # 保存解析结果用于检查
+        await _save_parsed_text(doc_id, filepath.stem, text)
 
         # 3. 获取文档信息用于 metadata
         async with get_session_context() as db:
