@@ -136,3 +136,39 @@ export interface DocumentStatusResponse {
     created_at: string;
     updated_at: string;
 }
+
+/** 文档列表项 */
+export interface DocumentListItem {
+    id: number;
+    filename: string;
+    filesize: number;
+    status: DocumentStatus;
+    error_message?: string;
+    summary?: string;
+    created_at: string;
+    updated_at?: string;
+}
+
+/** 文档列表响应 */
+export interface DocumentListResponse {
+    total: number;
+    items: DocumentListItem[];
+}
+
+/** 文档删除响应 */
+export interface DocumentDeleteResponse {
+    id: number;
+    message: string;
+}
+
+/** 文档重命名请求 */
+export interface DocumentRenameRequest {
+    filename: string;
+}
+
+/** 文档重命名响应 */
+export interface DocumentRenameResponse {
+    id: number;
+    filename: string;
+    message: string;
+}

@@ -289,3 +289,4 @@ secrets/
 docs/
 .claude/
 Claude.md
+parsed_texts/

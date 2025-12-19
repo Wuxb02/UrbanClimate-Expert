@@ -19,6 +19,10 @@
                     <el-icon><Share /></el-icon>
                     <span>知识图谱</span>
                 </el-menu-item>
+                <el-menu-item index="/documents">
+                    <el-icon><Document /></el-icon>
+                    <span>文档管理</span>
+                </el-menu-item>
             </el-menu>
         </el-header>
         <el-main class="app-main">
@@ -29,7 +33,7 @@
 
 <script setup lang="ts">
 import { useRoute } from 'vue-router';
-import { Sunrise, ChatDotRound, Share } from '@element-plus/icons-vue';
+import { Sunrise, ChatDotRound, Share, Document } from '@element-plus/icons-vue';
 
 const route = useRoute();
 </script>

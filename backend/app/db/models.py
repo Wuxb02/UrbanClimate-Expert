@@ -82,6 +82,11 @@ class Document(Base):
         Integer, nullable=True, comment="提取的关系数量"
     )
 
+    # 文档摘要
+    summary = Column(
+        Text, nullable=True, comment="LLM生成的文档摘要"
+    )
+
     # 时间戳
     created_at = Column(
         DateTime,

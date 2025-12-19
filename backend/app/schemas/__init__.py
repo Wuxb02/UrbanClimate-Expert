@@ -2,6 +2,7 @@
 from app.schemas.chat import ChatChunk, ChatRequest, ChatResponse, Citation
 from app.schemas.common import ErrorResponse, SuccessResponse
 from app.schemas.document import (
+    DocumentDeleteResponse,
     DocumentListItem,
     DocumentListResponse,
     DocumentStatusResponse,
@@ -19,6 +20,7 @@ __all__ = [
     "DocumentStatusResponse",
     "DocumentListItem",
     "DocumentListResponse",
+    "DocumentDeleteResponse",
     # Common schemas
     "ErrorResponse",
     "SuccessResponse",

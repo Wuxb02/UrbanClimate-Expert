@@ -19,6 +19,8 @@ from fastapi import (
     UploadFile,
     status,
 )
+from fastapi.responses import FileResponse
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -26,10 +28,17 @@ from app.core.config import settings
 from app.core.logger import logger
 from app.db import Document, DocumentStatus, get_async_session, get_session_context
 from app.schemas import (
+    DocumentDeleteResponse,
     DocumentListItem,
     DocumentListResponse,
     DocumentStatusResponse,
     DocumentUploadResponse,
+)
+from app.core.llm_factory import LLMFactory
+from app.core.prompts import (
+    DOCUMENT_SUMMARY_PROMPT,
+    SUMMARY_MAX_INPUT_LENGTH,
+    SUMMARY_MAX_OUTPUT_LENGTH,
 )
 from app.services.parser_service import get_parser_service, validate_pdf
 from app.services.rag_service import get_rag_service
@@ -40,6 +49,63 @@ router = APIRouter(prefix="/documents", tags=["documents"])
 def _calculate_sha256(content: bytes) -> str:
     """计算文件 SHA256 哈希"""
     return hashlib.sha256(content).hexdigest()
+
+
+async def _generate_summary(text: str) -> str:
+    """
+    使用 LLM 生成文档摘要
+
+    Args:
+        text: 文档全文
+
+    Returns:
+        生成的摘要文本
+    """
+    try:
+        # 限制输入长度，避免超出 LLM 上下文限制
+        content = text[:SUMMARY_MAX_INPUT_LENGTH] if len(text) > SUMMARY_MAX_INPUT_LENGTH else text
+
+        llm = LLMFactory.build_chat_model()
+        prompt = DOCUMENT_SUMMARY_PROMPT.format(content=content)
+        summary = await llm(prompt, None)
+
+        # 清理摘要文本
+        summary = summary.strip()
+        # 限制摘要长度
+        if len(summary) > SUMMARY_MAX_OUTPUT_LENGTH:
+            summary = summary[:SUMMARY_MAX_OUTPUT_LENGTH] + "..."
+
+        return summary
+    except Exception as e:
+        logger.warning(f"生成摘要失败: {e}")
+        return ""
+
+
+async def _update_document_summary(doc_id: int, summary: str) -> bool:
+    """
+    更新文档摘要
+
+    Args:
+        doc_id: 文档 ID
+        summary: 摘要文本
+
+    Returns:
+        True 表示更新成功，False 表示更新失败
+    """
+    try:
+        async with get_session_context() as db:
+            result = await db.execute(
+                select(Document).where(Document.id == doc_id)
+            )
+            doc = result.scalar_one_or_none()
+            if doc:
+                doc.summary = summary
+                await db.commit()
+                return True
+            return False
+    except Exception as e:
+        logger.warning(f"更新摘要失败 | doc_id: {doc_id} | 错误: {e}")
+        return False
 
 
 async def _save_parsed_text(doc_id: int, filename_stem: str, text: str) -> None:
@@ -176,7 +242,22 @@ async def _process_document_background(doc_id: int, filepath: Path) -> None:
             },
         )
 
-        # 5. 标记为 COMPLETED（使用独立会话）
+        # 5. 生成文档摘要
+        logger.info(f"开始生成文档摘要 | doc_id: {doc_id}")
+        summary_start = time.perf_counter()
+        summary = await _generate_summary(text)
+        summary_elapsed = (time.perf_counter() - summary_start) * 1000
+
+        if summary:
+            await _update_document_summary(doc_id, summary)
+            logger.info(
+                f"文档摘要生成成功 | doc_id: {doc_id} | "
+                f"摘要长度: {len(summary)} | 耗时: {summary_elapsed:.2f}ms"
+            )
+        else:
+            logger.warning(f"文档摘要生成失败 | doc_id: {doc_id}")
+
+        # 6. 标记为 COMPLETED（使用独立会话）
         await _update_document_status(doc_id, DocumentStatus.COMPLETED)
 
         total_elapsed = (time.perf_counter() - task_start_time) * 1000
@@ -186,7 +267,7 @@ async def _process_document_background(doc_id: int, filepath: Path) -> None:
         )
 
     except Exception as e:
-        # 6. 标记为 FAILED（使用独立会话）
+        # 7. 标记为 FAILED（使用独立会话）
         await _update_document_status(doc_id, DocumentStatus.FAILED, str(e))
 
         total_elapsed = (time.perf_counter() - task_start_time) * 1000
@@ -327,19 +408,31 @@ async def get_document_status(
 async def list_documents(
     page: int = 1,
     page_size: int = 20,
+    keyword: str | None = None,
     db: AsyncSession = Depends(get_async_session),
 ) -> DocumentListResponse:
     """
     获取文档列表(分页)
+
+    支持按文件名关键词搜索
     """
+    # 构建基础查询
+    base_query = select(Document)
+
+    # 如果有关键词，添加过滤条件
+    if keyword and keyword.strip():
+        base_query = base_query.where(
+            Document.filename.ilike(f"%{keyword.strip()}%")
+        )
+
     # 查询总数
-    count_result = await db.execute(select(Document))
+    count_result = await db.execute(base_query)
     total = len(count_result.scalars().all())
 
     # 查询分页数据
     offset = (page - 1) * page_size
     result = await db.execute(
-        select(Document)
+        base_query
         .order_by(Document.created_at.desc())
         .offset(offset)
         .limit(page_size)
@@ -349,4 +442,146 @@ async def list_documents(
     return DocumentListResponse(
         total=total,
         items=[DocumentListItem.model_validate(doc) for doc in items],
+    )
+
+
+@router.delete("/{doc_id}", response_model=DocumentDeleteResponse)
+async def delete_document(
+    doc_id: int,
+    db: AsyncSession = Depends(get_async_session),
+) -> DocumentDeleteResponse:
+    """
+    删除文档
+
+    - 从数据库中删除文档记录
+    - 同时删除关联的文件
+    """
+    logger.info(f"接收文档删除请求 | doc_id: {doc_id}")
+
+    # 查询文档
+    result = await db.execute(select(Document).where(Document.id == doc_id))
+    doc = result.scalar_one_or_none()
+
+    if not doc:
+        logger.warning(f"删除失败：文档不存在 | doc_id: {doc_id}")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="文档不存在"
+        )
+
+    # 删除文件
+    filepath = Path(doc.filepath)
+    if filepath.exists():
+        try:
+            filepath.unlink()
+            logger.info(f"文件删除成功 | 路径: {filepath}")
+        except Exception as e:
+            logger.warning(f"文件删除失败 | 路径: {filepath} | 错误: {e}")
+
+    # 删除解析结果文件
+    parsed_dir = settings.upload_dir_path.parent / "parsed_texts"
+    if parsed_dir.exists():
+        for parsed_file in parsed_dir.glob(f"{doc_id}_*"):
+            try:
+                parsed_file.unlink()
+                logger.info(f"解析文件删除成功 | 路径: {parsed_file}")
+            except Exception as e:
+                logger.warning(f"解析文件删除失败 | 路径: {parsed_file} | 错误: {e}")
+
+    # 删除数据库记录
+    await db.delete(doc)
+    await db.commit()
+
+    logger.info(f"文档删除成功 | doc_id: {doc_id}")
+
+    return DocumentDeleteResponse(id=doc_id, message="文档删除成功")
+
+
+@router.get("/{doc_id}/download")
+async def download_document(
+    doc_id: int,
+    db: AsyncSession = Depends(get_async_session),
+):
+    """
+    下载文档
+
+    返回原始 PDF 文件
+    """
+    result = await db.execute(select(Document).where(Document.id == doc_id))
+    doc = result.scalar_one_or_none()
+
+    if not doc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="文档不存在"
+        )
+
+    filepath = Path(doc.filepath)
+    if not filepath.exists():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="文件不存在"
+        )
+
+    logger.info(f"文档下载请求 | doc_id: {doc_id} | 文件名: {doc.filename}")
+
+    return FileResponse(
+        path=filepath,
+        filename=doc.filename,
+        media_type="application/pdf"
+    )
+
+
+class DocumentRenameRequest(BaseModel):
+    """文档重命名请求"""
+    filename: str = Field(..., min_length=1, max_length=255, description="新文件名")
+
+
+class DocumentRenameResponse(BaseModel):
+    """文档重命名响应"""
+    id: int
+    filename: str
+    message: str = "重命名成功"
+
+
+@router.patch("/{doc_id}/rename", response_model=DocumentRenameResponse)
+async def rename_document(
+    doc_id: int,
+    request: DocumentRenameRequest,
+    db: AsyncSession = Depends(get_async_session),
+) -> DocumentRenameResponse:
+    """
+    重命名文档
+
+    只修改显示的文件名，不修改实际存储的文件
+    """
+    result = await db.execute(select(Document).where(Document.id == doc_id))
+    doc = result.scalar_one_or_none()
+
+    if not doc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="文档不存在"
+        )
+
+    old_filename = doc.filename
+    new_filename = request.filename.strip()
+
+    # 确保文件名以 .pdf 结尾
+    if not new_filename.lower().endswith(".pdf"):
+        new_filename += ".pdf"
+
+    doc.filename = new_filename
+    await db.commit()
+    await db.refresh(doc)
+
+    logger.info(
+        f"文档重命名成功 | doc_id: {doc_id} | "
+        f"原文件名: {old_filename} | 新文件名: {new_filename}"
+    )
+
+    return DocumentRenameResponse(
+        id=doc_id,
+        filename=new_filename,
+        message="重命名成功"
     )

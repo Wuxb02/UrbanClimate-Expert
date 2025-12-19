@@ -21,6 +21,7 @@ from lightrag.utils import EmbeddingFunc
 
 from app.core.config import settings
 from app.core.logger import logger
+from app.core.prompts import RAG_QUERY_PROMPT, RAG_STREAM_QUERY_PROMPT
 
 
 def _remove_references_section(text: str) -> str:
@@ -475,16 +476,12 @@ class LightRAGService:
         logger.info(f"RAG 查询开始 | 模式: {mode} | 问题: {question[:100]}...")
         start_time = time.perf_counter()
 
-        strict_prompt = (
-            "【重要指令】请完全基于检索到的上下文（Context）来回答用户的问题。"
-            "即使上下文中包含你不知道的概念，也要根据上下文中的描述进行解释。"
-            "不要使用你的预训练知识，不要提及你的知识截止日期。"
-            f"\n\n用户问题：{question}"
-        )
+        # 使用统一管理的提示词
+        prompt = RAG_QUERY_PROMPT.format(question=question)
 
         try:
             result = await self.rag.aquery(
-                strict_prompt,
+                prompt,
                 param=QueryParam(mode=mode, stream=False)
             )
             elapsed_ms = (time.perf_counter() - start_time) * 1000
@@ -507,15 +504,11 @@ class LightRAGService:
         """
         logger.info(f"RAG 流式查询开始 | 模式: {mode} | 问题: {question[:100]}...")
 
-        strict_prompt = (
-            "【重要指令】请完全基于检索到的上下文（Context）来回答用户的问题。"
-            "即使上下文中包含你不知道的概念，也要根据上下文中的描述进行解释。"
-            "不要提及你的知识截止日期。"
-            f"\n\n用户问题：{question}"
-        )
+        # 使用统一管理的提示词
+        prompt = RAG_STREAM_QUERY_PROMPT.format(question=question)
 
         result = await self.rag.aquery(
-            strict_prompt,
+            prompt,
             param=QueryParam(mode=mode, stream=True)
         )
 

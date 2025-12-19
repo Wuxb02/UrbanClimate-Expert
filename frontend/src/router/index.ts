@@ -20,6 +20,12 @@ const routes: RouteRecordRaw[] = [
         component: () => import('@/views/Graph.vue'),
         meta: { title: '知识图谱' },
     },
+    {
+        path: '/documents',
+        name: 'Documents',
+        component: () => import('@/views/Documents.vue'),
+        meta: { title: '文档管理' },
+    },
 ];
 
 const router = createRouter({
