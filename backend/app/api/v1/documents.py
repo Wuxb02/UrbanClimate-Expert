@@ -230,19 +230,7 @@ async def _process_document_background(doc_id: int, filepath: Path) -> None:
                 return
             filename = doc.filename
 
-        # 4. 插入 LightRAG
-        logger.info(f"开始插入 LightRAG | doc_id: {doc_id}")
-        rag = await get_rag_service()
-        await rag.insert_document(
-            text=text,
-            metadata={
-                "doc_id": doc_id,
-                "filename": filename,
-                "filepath": str(filepath),
-            },
-        )
-
-        # 5. 生成文档摘要
+        # 4. 生成文档摘要
         logger.info(f"开始生成文档摘要 | doc_id: {doc_id}")
         summary_start = time.perf_counter()
         summary = await _generate_summary(text)
@@ -256,6 +244,19 @@ async def _process_document_background(doc_id: int, filepath: Path) -> None:
             )
         else:
             logger.warning(f"文档摘要生成失败 | doc_id: {doc_id}")
+
+
+        # 5. 插入 LightRAG
+        logger.info(f"开始插入 LightRAG | doc_id: {doc_id}")
+        rag = await get_rag_service()
+        await rag.insert_document(
+            text=text,
+            metadata={
+                "doc_id": doc_id,
+                "filename": filename,
+                "filepath": str(filepath),
+            },
+        )
 
         # 6. 标记为 COMPLETED（使用独立会话）
         await _update_document_status(doc_id, DocumentStatus.COMPLETED)
