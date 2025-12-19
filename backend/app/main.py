@@ -8,6 +8,7 @@ from app.core.config import settings
 from app.core.logger import logger, setup_logging
 from app.db import close_db, init_db
 from app.middleware import RequestLoggingMiddleware
+from app.services.neo4j_service import get_neo4j_service
 
 # 初始化日志系统（在应用创建之前）
 setup_logging(
@@ -24,17 +25,40 @@ async def lifespan(app: FastAPI):
     """应用生命周期管理"""
     # 启动时
     logger.info(f"应用启动中... | 环境: {settings.environment}")
-    logger.info("初始化数据库...")
+
+    # 初始化 MySQL
+    logger.info("初始化 MySQL 数据库...")
     await init_db()
-    logger.info("数据库初始化完成")
+    logger.info("MySQL 数据库初始化完成")
+
+    # 初始化 Neo4j (必需)
+    logger.info("初始化 Neo4j 图数据库...")
+    try:
+        get_neo4j_service()
+        logger.info("Neo4j 图数据库初始化完成")
+    except Exception as e:
+        logger.error(f"Neo4j 初始化失败 | 错误: {e}")
+        logger.warning("应用将在没有 Neo4j 的情况下启动 (图查询功能不可用)")
 
     yield
 
     # 关闭时
     logger.info("应用关闭中...")
-    logger.info("关闭数据库连接...")
+
+    # 关闭 Neo4j
+    logger.info("关闭 Neo4j 连接...")
+    try:
+        neo4j_service = get_neo4j_service()
+        neo4j_service.close()
+        logger.info("Neo4j 连接已关闭")
+    except Exception as e:
+        logger.warning(f"Neo4j 关闭失败 | 错误: {e}")
+
+    # 关闭 MySQL
+    logger.info("关闭 MySQL 连接...")
     await close_db()
-    logger.info("数据库连接已关闭")
+    logger.info("MySQL 连接已关闭")
+
     logger.info("应用已优雅关闭")
 
 

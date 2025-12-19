@@ -6,7 +6,10 @@
 - 节点详情获取
 - 邻居子图获取
 - 图谱统计信息
+- Neo4j 管理端点(同步、清空)
 """
+import asyncio
+import time
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query
@@ -19,6 +22,7 @@ from app.schemas.graph import (
     NeighborsResponse,
 )
 from app.services.graph_service import get_graph_service
+from app.services.neo4j_service import get_neo4j_service
 
 router = APIRouter(prefix="/graph", tags=["graph"])
 
@@ -44,7 +48,7 @@ async def query_graph(
     )
 
     service = get_graph_service()
-    return service.query_nodes(
+    return await service.query_nodes(
         keyword=q,
         entity_type=entity_type,
         limit=limit,
@@ -66,7 +70,7 @@ async def get_node_detail(node_id: str) -> GraphNodeDetail:
     logger.info(f"接收节点详情请求 | node_id: {node_id}")
 
     service = get_graph_service()
-    detail = service.get_node_detail(node_id)
+    detail = await service.get_node_detail(node_id)
 
     if detail is None:
         raise HTTPException(status_code=404, detail=f"节点不存在: {node_id}")
@@ -90,7 +94,7 @@ async def get_neighbors(
     logger.info(f"接收邻居子图请求 | node_id: {node_id} | limit: {limit}")
 
     service = get_graph_service()
-    neighbors = service.get_neighbors(node_id, limit=limit)
+    neighbors = await service.get_neighbors(node_id, limit=limit)
 
     if neighbors is None:
         raise HTTPException(status_code=404, detail=f"节点不存在: {node_id}")
@@ -112,4 +116,115 @@ async def get_graph_stats() -> GraphStats:
     logger.info("接收图谱统计请求")
 
     service = get_graph_service()
-    return service.get_stats()
+    return await service.get_stats()
+
+
+@router.post("/admin/neo4j/sync", tags=["admin"])
+async def trigger_neo4j_sync(
+    mode: str = Query(default="json", pattern="^(json|graphml)$")
+):
+    """
+    手动触发 Neo4j 全量同步
+
+    **模式**:
+    - json: 从 JSON 文件同步（推荐，更快，支持增量）
+    - graphml: 从 GraphML 文件同步（备用）
+
+    **功能**:
+    - 读取 LightRAG 工作区中的数据文件
+    - 将所有节点和关系 UPSERT 到 Neo4j 数据库
+    - 返回同步统计信息
+
+    **使用场景**:
+    - Neo4j 数据丢失或损坏后恢复
+    - 修改 Neo4j 配置后重新同步
+    - 定期数据校验和同步
+
+    **注意**: 这是一个幂等操作，重复执行不会导致数据重复
+    """
+    logger.info(f"接收 Neo4j 全量同步请求 | 模式: {mode}")
+
+    try:
+        neo4j_service = get_neo4j_service()
+
+        if mode == "json":
+            # JSON 模式：全量同步（不使用增量过滤）
+            stats = await asyncio.to_thread(
+                neo4j_service.sync_from_json,
+                None,  # doc_id=None 表示全量同步
+                incremental=False,  # 全量模式
+            )
+
+            # 更新同步时间戳
+            current_ts = int(time.time())
+            await asyncio.to_thread(
+                neo4j_service.update_sync_timestamp,
+                current_ts,
+            )
+        else:
+            # GraphML 模式（备用）
+            stats = await asyncio.to_thread(
+                neo4j_service.sync_from_graphml,
+                None,
+            )
+
+        logger.info(
+            f"Neo4j 全量同步完成 ({mode}) | "
+            f"节点: {stats['nodes_synced']} | 边: {stats['edges_synced']}"
+        )
+
+        return {
+            "message": f"Neo4j 同步完成 (模式: {mode})",
+            "mode": mode,
+            "nodes_synced": stats["nodes_synced"],
+            "edges_synced": stats["edges_synced"],
+        }
+
+    except Exception as e:
+        logger.error(f"Neo4j 同步失败 | 错误: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Neo4j 同步失败: {str(e)}"
+        )
+
+
+@router.delete("/admin/neo4j/clear", tags=["admin"])
+async def clear_neo4j():
+    """
+    清空 Neo4j 数据库（危险操作！）
+
+    **功能**:
+    - 删除 Neo4j 中所有节点和关系
+    - 返回删除的节点数量
+
+    **使用场景**:
+    - 完全重建图谱前清理旧数据
+    - 测试环境数据重置
+
+    **警告**:
+    - 这是一个不可逆操作！
+    - 生产环境慎用！
+    - 建议在操作前备份 Neo4j 数据库
+
+    **恢复方法**:
+    - 清空后可通过 `/admin/neo4j/sync` 端点从 GraphML 重新同步
+    """
+    logger.warning("接收 Neo4j 清空请求 | 这是危险操作！")
+
+    try:
+        neo4j_service = get_neo4j_service()
+        count = await asyncio.to_thread(neo4j_service.clear_all)
+
+        logger.warning(f"Neo4j 数据库已清空 | 删除节点数: {count}")
+
+        return {
+            "message": "Neo4j 数据库已清空",
+            "deleted_nodes": count,
+        }
+
+    except Exception as e:
+        logger.error(f"Neo4j 清空失败 | 错误: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Neo4j 清空失败: {str(e)}"
+        )

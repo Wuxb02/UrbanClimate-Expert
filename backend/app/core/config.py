@@ -47,9 +47,12 @@ class Settings(BaseSettings):
 
     # Database configuration
     mysql_dsn: str = "mysql+aiomysql://root:password@localhost:3306/urban_climate"
+
+    # Neo4j configuration (必需，作为主图存储)
     neo4j_uri: str = "bolt://localhost:7687"
     neo4j_user: str = "neo4j"
     neo4j_password: str = "neo4j-password"
+    neo4j_database: str = "neo4j"  # 默认数据库名
 
     # File storage configuration
     upload_dir: str = "./uploads"

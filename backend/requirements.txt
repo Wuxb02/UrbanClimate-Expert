@@ -10,3 +10,4 @@ aiomysql>=0.2.0
 networkx>=3.3
 python-multipart>=0.0.9
 loguru>=0.7.0
+neo4j>=5.15.0

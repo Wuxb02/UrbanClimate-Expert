@@ -246,8 +246,11 @@ async def _process_document_background(doc_id: int, filepath: Path) -> None:
             logger.warning(f"文档摘要生成失败 | doc_id: {doc_id}")
 
 
-        # 5. 插入 LightRAG
-        logger.info(f"开始插入 LightRAG | doc_id: {doc_id}")
+        # 5. 插入 LightRAG (自动写入 Neo4j)
+        logger.info(
+            f"开始插入 LightRAG | doc_id: {doc_id} | "
+            f"图存储: Neo4j (原生支持)"
+        )
         rag = await get_rag_service()
         await rag.insert_document(
             text=text,
@@ -257,6 +260,13 @@ async def _process_document_background(doc_id: int, filepath: Path) -> None:
                 "filepath": str(filepath),
             },
         )
+        logger.info(
+            f"LightRAG 插入成功 | doc_id: {doc_id} | "
+            f"图数据已自动写入 Neo4j"
+        )
+
+        # 注意: LightRAG 使用 graph_storage="Neo4JStorage" 配置后，
+        # 图数据会直接写入 Neo4j，无需额外同步步骤
 
         # 6. 标记为 COMPLETED（使用独立会话）
         await _update_document_status(doc_id, DocumentStatus.COMPLETED)

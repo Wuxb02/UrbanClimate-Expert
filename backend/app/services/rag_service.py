@@ -336,7 +336,7 @@ class LightRAGService:
         # 根据配置选择 LLM
         if settings.llm_type == "ollama":
             logger.debug(f"使用 Ollama LLM | 模型: {settings.ollama_model}")
-            # 使用 Ollama LLM + Ollama Embedding
+            # 使用 Ollama LLM + Ollama Embedding + Neo4j 图存储
             self.rag = LightRAG(
                 working_dir=str(workspace),
                 llm_model_func=ollama_model_complete,
@@ -347,17 +347,19 @@ class LightRAGService:
                 },
                 embedding_func=embedding_config,
                 rerank_model_func=rerank_func,
+                graph_storage="Neo4JStorage",  # 使用 Neo4j 作为图存储
                 default_llm_timeout=settings.llm_timeout,
                 default_embedding_timeout=settings.embedding_timeout,
             )
         elif settings.llm_type == "openai":
             logger.debug(f"使用 OpenAI LLM | 模型: {settings.openai_model}")
-            # 使用 OpenAI LLM + Ollama Embedding
+            # 使用 OpenAI LLM + Ollama Embedding + Neo4j 图存储
             self.rag = LightRAG(
                 working_dir=str(workspace),
                 llm_model_func=_openai_llm_func,
                 embedding_func=embedding_config,
                 rerank_model_func=rerank_func,
+                graph_storage="Neo4JStorage",  # 使用 Neo4j 作为图存储
                 default_llm_timeout=settings.llm_timeout,
                 default_embedding_timeout=settings.embedding_timeout,
             )
@@ -365,7 +367,11 @@ class LightRAGService:
             logger.error(f"不支持的 LLM 类型: {settings.llm_type}")
             raise ValueError(f"不支持的 LLM 类型: {settings.llm_type}，请使用 'ollama' 或 'openai'")
 
-        logger.info(f"LightRAG 配置完成 | Rerank 启用: {settings.enable_rerank}")
+        logger.info(
+            f"LightRAG 配置完成 | "
+            f"图存储: Neo4j | "
+            f"Rerank 启用: {settings.enable_rerank}"
+        )
 
     async def initialize(self) -> None:
         """初始化存储"""

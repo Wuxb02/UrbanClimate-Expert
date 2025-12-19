@@ -1,22 +1,20 @@
 """
-图谱服务层
+图谱服务层（基于 Neo4j）
 
 功能:
-- GraphML 文件加载与缓存(基于 mtime)
-- 节点查询(支持关键词、类型过滤、分页)
-- 节点详情获取(含度数计算)
-- 邻居子图提取
-- 统计信息计算
+- 节点查询(支持关键词、类型过滤、分页) - 使用 Cypher
+- 节点详情获取(含度数计算) - 使用 Cypher
+- 邻居子图提取 - 使用 Cypher
+- 统计信息计算 - 使用 Cypher
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-
-import networkx as nx
 
 from app.core.config import settings
 from app.core.logger import logger
@@ -29,71 +27,19 @@ from app.schemas.graph import (
     GraphStats,
     NeighborsResponse,
 )
+from app.services.neo4j_service import get_neo4j_service
 
 
 class GraphService:
-    """图谱服务类"""
+    """图谱服务类（基于 Neo4j）"""
 
     def __init__(self) -> None:
-        self._graph: nx.Graph | None = None
-        self._last_mtime: float = 0.0
-        self._entity_type_cache: dict[str, int] = {}
         self._chunk_cache: dict[str, dict[str, Any]] = {}
-
-    @property
-    def graph_file_path(self) -> Path:
-        """获取 GraphML 文件路径"""
-        return settings.lightrag_workspace_path / "graph_chunk_entity_relation.graphml"
 
     @property
     def chunks_file_path(self) -> Path:
         """获取文本分块文件路径"""
         return settings.lightrag_workspace_path / "kv_store_text_chunks.json"
-
-    def _load_graph_if_needed(self) -> nx.Graph:
-        """
-        按需加载图谱(基于文件 mtime 缓存)
-
-        Returns:
-            加载的 NetworkX 图对象
-        """
-        if not self.graph_file_path.exists():
-            logger.warning(f"图谱文件不存在 | 路径: {self.graph_file_path}")
-            return nx.Graph()
-
-        current_mtime = self.graph_file_path.stat().st_mtime
-
-        if self._graph is None or current_mtime > self._last_mtime:
-            logger.info(
-                f"加载图谱文件 | 路径: {self.graph_file_path} | "
-                f"mtime 变化: {self._last_mtime} -> {current_mtime}"
-            )
-            try:
-                self._graph = nx.read_graphml(self.graph_file_path)
-                self._last_mtime = current_mtime
-                self._update_entity_type_cache()
-                logger.info(
-                    f"图谱加载成功 | "
-                    f"节点数: {self._graph.number_of_nodes()} | "
-                    f"边数: {self._graph.number_of_edges()}"
-                )
-            except Exception as e:
-                logger.error(f"图谱文件加载失败 | 错误: {e}")
-                self._graph = nx.Graph()
-
-        return self._graph
-
-    def _update_entity_type_cache(self) -> None:
-        """更新实体类型缓存"""
-        if self._graph is None:
-            return
-
-        self._entity_type_cache.clear()
-        for _, data in self._graph.nodes(data=True):
-            entity_type = data.get("entity_type", "unknown")
-            self._entity_type_cache[entity_type] = (
-                self._entity_type_cache.get(entity_type, 0) + 1
-            )
 
     def _load_chunks_if_needed(self) -> dict[str, dict[str, Any]]:
         """加载文本分块数据"""
@@ -114,23 +60,29 @@ class GraphService:
 
         return self._chunk_cache
 
-    def _extract_snippets(self, source_ids: str) -> list[DocumentSnippet]:
+    def _extract_snippets(self, source_ids: list[str] | str) -> list[DocumentSnippet]:
         """
         从 source_id 提取文档片段
 
         Args:
-            source_ids: 以 <SEP> 分隔的 chunk ID 字符串
+            source_ids: chunk ID 列表或以 <SEP> 分隔的字符串
 
         Returns:
             文档片段列表
         """
-        if not source_ids:
+        # 处理 source_ids 参数
+        if isinstance(source_ids, str):
+            if not source_ids:
+                return []
+            chunk_ids = [cid.strip() for cid in source_ids.split("<SEP>")]
+        else:
+            chunk_ids = source_ids
+
+        if not chunk_ids:
             return []
 
         chunks = self._load_chunks_if_needed()
         snippets: list[DocumentSnippet] = []
-
-        chunk_ids = [cid.strip() for cid in source_ids.split("<SEP>")]
 
         for chunk_id in chunk_ids[:5]:  # 限制最多 5 个片段
             if chunk_id not in chunks:
@@ -162,35 +114,32 @@ class GraphService:
 
         return snippets
 
-    def _node_to_graph_node(
-        self, node_id: str, data: dict[str, Any]
-    ) -> GraphNode:
-        """将 NetworkX 节点数据转换为 GraphNode"""
-        # 合并多个描述(用 <SEP> 分隔)
-        description = data.get("description", "")
-        if "<SEP>" in description:
-            # 只取第一个描述，避免过长
-            description = description.split("<SEP>")[0].strip()
+    def _neo4j_node_to_graph_node(self, node_record: dict[str, Any]) -> GraphNode:
+        """将 Neo4j 节点记录转换为 GraphNode"""
+        # 取描述的第一段（如果有多段的话）
+        description = node_record.get("description", "")
+        if "\n\n" in description:
+            description = description.split("\n\n")[0].strip()
 
         return GraphNode(
-            id=node_id,
-            title=data.get("entity_id", node_id),
+            id=node_record.get("name", ""),
+            title=node_record.get("entity_id", node_record.get("name", "")),
             description=description,
-            entity_type=data.get("entity_type", "unknown"),
+            entity_type=node_record.get("entity_type", "unknown"),
         )
 
-    def _edge_to_graph_edge(
-        self, source: str, target: str, data: dict[str, Any]
+    def _neo4j_edge_to_graph_edge(
+        self, source: str, target: str, rel_data: dict[str, Any]
     ) -> GraphEdge:
-        """将 NetworkX 边数据转换为 GraphEdge"""
+        """将 Neo4j 关系转换为 GraphEdge"""
         return GraphEdge(
             source=source,
             target=target,
-            relation=data.get("description", "related_to"),
-            weight=float(data.get("weight", 1.0)),
+            relation=rel_data.get("description", "related_to"),
+            weight=float(rel_data.get("weight", 1.0)),
         )
 
-    def query_nodes(
+    async def query_nodes(
         self,
         keyword: str = "",
         entity_type: str | None = None,
@@ -198,10 +147,10 @@ class GraphService:
         offset: int = 0,
     ) -> GraphQueryResponse:
         """
-        查询节点和边，支持分页
+        查询节点和边，支持分页（使用 Neo4j Cypher）
 
         Args:
-            keyword: 搜索关键词(匹配 node_id, entity_id, description)
+            keyword: 搜索关键词(匹配 name, description)
             entity_type: 过滤实体类型
             limit: 返回节点数量限制
             offset: 偏移量
@@ -209,68 +158,115 @@ class GraphService:
         Returns:
             GraphQueryResponse 包含节点、边、总数和是否有更多数据
         """
-        graph = self._load_graph_if_needed()
-
         logger.info(
-            f"图谱查询 | 关键词: '{keyword or '(全部)'}' | "
+            f"图谱查询(Neo4j) | 关键词: '{keyword or '(全部)'}' | "
             f"类型: {entity_type or '(全部)'} | limit: {limit} | offset: {offset}"
         )
 
-        matched_nodes: list[GraphNode] = []
+        neo4j_service = get_neo4j_service()
 
-        for node_id, data in graph.nodes(data=True):
-            # 类型过滤
-            if entity_type and data.get("entity_type", "unknown") != entity_type:
-                continue
+        # 构建 Cypher 查询
+        # 1. 查询匹配的节点
+        node_query = """
+        MATCH (n:Entity)
+        WHERE ($keyword = '' OR n.name CONTAINS $keyword OR n.description CONTAINS $keyword)
+          AND ($entity_type IS NULL OR n.entity_type = $entity_type)
+        RETURN n.name AS name, n.entity_id AS entity_id, n.entity_type AS entity_type,
+               n.description AS description
+        ORDER BY n.name
+        SKIP $offset
+        LIMIT $limit
+        """
 
-            # 关键词匹配
-            if keyword.strip():
-                keyword_lower = keyword.lower()
-                entity_id = data.get("entity_id", node_id).lower()
-                description = data.get("description", "").lower()
+        # 2. 查询总数
+        count_query = """
+        MATCH (n:Entity)
+        WHERE ($keyword = '' OR n.name CONTAINS $keyword OR n.description CONTAINS $keyword)
+          AND ($entity_type IS NULL OR n.entity_type = $entity_type)
+        RETURN count(n) AS total
+        """
 
-                if not (
-                    keyword_lower in node_id.lower()
-                    or keyword_lower in entity_id
-                    or keyword_lower in description
-                ):
-                    continue
+        params = {
+            "keyword": keyword,
+            "entity_type": entity_type,
+            "offset": offset,
+            "limit": limit,
+        }
 
-            matched_nodes.append(self._node_to_graph_node(node_id, data))
+        nodes: list[GraphNode] = []
+        total_count = 0
 
-        # 计算总数
-        total_nodes = len(matched_nodes)
+        def _query_neo4j():
+            nonlocal nodes, total_count
 
-        # 应用分页
-        paginated_nodes = matched_nodes[offset : offset + limit]
+            with neo4j_service.driver.session(database=settings.neo4j_database) as session:
+                # 查询节点
+                result = session.run(node_query, params)
+                node_records = list(result)
 
-        # 获取分页后节点的 ID 集合
-        node_ids = {n.id for n in paginated_nodes}
+                for record in node_records:
+                    node_data = {
+                        "name": record["name"],
+                        "entity_id": record["entity_id"],
+                        "entity_type": record["entity_type"],
+                        "description": record["description"],
+                    }
+                    nodes.append(self._neo4j_node_to_graph_node(node_data))
 
-        # 获取相关的边(至少一端在节点集合中)
+                # 查询总数
+                result = session.run(count_query, params)
+                total_count = result.single()["total"]
+
+        # 使用 asyncio.to_thread 避免阻塞
+        await asyncio.to_thread(_query_neo4j)
+
+        # 获取匹配节点的 ID 列表
+        node_ids = [n.id for n in nodes]
+
+        # 3. 查询这些节点之间的边
         edges: list[GraphEdge] = []
-        for source, target, data in graph.edges(data=True):
-            if source in node_ids or target in node_ids:
-                edges.append(self._edge_to_graph_edge(source, target, data))
+        if node_ids:
+            edge_query = """
+            MATCH (a:Entity)-[r:RELATED_TO]->(b:Entity)
+            WHERE a.name IN $node_ids AND b.name IN $node_ids
+            RETURN a.name AS source, b.name AS target,
+                   r.description AS description, r.weight AS weight
+            """
 
-        has_more = offset + limit < total_nodes
+            def _query_edges():
+                nonlocal edges
+                with neo4j_service.driver.session(database=settings.neo4j_database) as session:
+                    result = session.run(edge_query, {"node_ids": node_ids})
+                    for record in result:
+                        rel_data = {
+                            "description": record["description"],
+                            "weight": record["weight"],
+                        }
+                        edges.append(
+                            self._neo4j_edge_to_graph_edge(
+                                record["source"], record["target"], rel_data
+                            )
+                        )
+
+            await asyncio.to_thread(_query_edges)
+
+        has_more = (offset + len(nodes)) < total_count
 
         logger.info(
-            f"图谱查询完成 | 匹配节点: {total_nodes} | "
-            f"返回节点: {len(paginated_nodes)} | 相关边: {len(edges)} | "
-            f"has_more: {has_more}"
+            f"查询完成 | 返回节点: {len(nodes)} | 边: {len(edges)} | "
+            f"总数: {total_count} | 有更多: {has_more}"
         )
 
         return GraphQueryResponse(
-            nodes=paginated_nodes,
+            nodes=nodes,
             edges=edges,
-            total_nodes=total_nodes,
+            total=total_count,
             has_more=has_more,
         )
 
-    def get_node_detail(self, node_id: str) -> GraphNodeDetail | None:
+    async def get_node_detail(self, node_id: str) -> GraphNodeDetail | None:
         """
-        获取节点详情
+        获取节点详情（使用 Neo4j Cypher）
 
         Args:
             node_id: 节点 ID
@@ -278,61 +274,67 @@ class GraphService:
         Returns:
             节点详情，如果节点不存在返回 None
         """
-        graph = self._load_graph_if_needed()
+        logger.info(f"获取节点详情(Neo4j) | node_id: {node_id}")
 
-        if node_id not in graph.nodes:
-            logger.warning(f"节点不存在 | node_id: {node_id}")
-            return None
+        neo4j_service = get_neo4j_service()
 
-        data = graph.nodes[node_id]
+        # Cypher 查询：获取节点详情和度数
+        query = """
+        MATCH (n:Entity {name: $node_id})
+        OPTIONAL MATCH (n)-[r:RELATED_TO]-()
+        RETURN n.name AS name, n.entity_id AS entity_id, n.entity_type AS entity_type,
+               n.description AS description, n.source_ids AS source_ids,
+               count(r) AS degree
+        """
 
-        # 计算度数
-        degree = graph.degree(node_id)
-        # 对于无向图，in_degree 和 out_degree 相同
-        # 如果是有向图，可以分别计算
-        if isinstance(graph, nx.DiGraph):
-            in_degree = graph.in_degree(node_id)
-            out_degree = graph.out_degree(node_id)
-        else:
-            in_degree = degree
-            out_degree = degree
+        node_detail = None
 
-        # 获取邻居节点 ID
-        neighbors = list(graph.neighbors(node_id))
+        def _query_neo4j():
+            nonlocal node_detail
 
-        # 提取关联文档片段
-        source_ids = data.get("source_id", "")
-        snippets = self._extract_snippets(source_ids)
+            with neo4j_service.driver.session(database=settings.neo4j_database) as session:
+                result = session.run(query, {"node_id": node_id})
+                record = result.single()
 
-        # 合并描述
-        description = data.get("description", "")
-        if "<SEP>" in description:
-            # 合并所有描述
-            descriptions = [d.strip() for d in description.split("<SEP>")]
-            description = "\n\n".join(descriptions)
+                if not record:
+                    logger.warning(f"节点不存在 | node_id: {node_id}")
+                    return
 
-        logger.debug(
-            f"获取节点详情 | node_id: {node_id} | "
-            f"degree: {degree} | snippets: {len(snippets)}"
-        )
+                # 构建 GraphNode
+                node_data = {
+                    "name": record["name"],
+                    "entity_id": record["entity_id"],
+                    "entity_type": record["entity_type"],
+                    "description": record["description"],
+                }
+                graph_node = self._neo4j_node_to_graph_node(node_data)
 
-        return GraphNodeDetail(
-            id=node_id,
-            title=data.get("entity_id", node_id),
-            description=description,
-            entity_type=data.get("entity_type", "unknown"),
-            degree=degree,
-            in_degree=in_degree,
-            out_degree=out_degree,
-            snippets=snippets,
-            neighbors=neighbors[:50],  # 限制邻居数量
-        )
+                degree = record["degree"]
+                source_ids = record["source_ids"] or []
 
-    def get_neighbors(
+                # 提取文档片段
+                snippets = self._extract_snippets(source_ids)
+
+                node_detail = GraphNodeDetail(
+                    node=graph_node,
+                    degree=degree,
+                    in_degree=degree,  # 对于无向图，in/out 相同
+                    out_degree=degree,
+                    snippets=snippets,
+                )
+
+        await asyncio.to_thread(_query_neo4j)
+
+        if node_detail:
+            logger.info(f"节点详情获取成功 | node_id: {node_id} | 度数: {node_detail.degree}")
+
+        return node_detail
+
+    async def get_neighbors(
         self, node_id: str, limit: int = 50
     ) -> NeighborsResponse | None:
         """
-        获取节点的邻居子图
+        获取节点的邻居子图（使用 Neo4j Cypher）
 
         Args:
             node_id: 中心节点 ID
@@ -341,65 +343,142 @@ class GraphService:
         Returns:
             邻居子图响应，如果节点不存在返回 None
         """
-        graph = self._load_graph_if_needed()
+        logger.info(f"获取邻居子图(Neo4j) | node_id: {node_id} | limit: {limit}")
 
-        if node_id not in graph.nodes:
-            logger.warning(f"节点不存在 | node_id: {node_id}")
-            return None
+        neo4j_service = get_neo4j_service()
 
-        # 获取中心节点
-        center_data = graph.nodes[node_id]
-        center_node = self._node_to_graph_node(node_id, center_data)
-
-        # 获取邻居节点
-        neighbor_ids = list(graph.neighbors(node_id))[:limit]
-        neighbors: list[GraphNode] = []
-        for nid in neighbor_ids:
-            ndata = graph.nodes[nid]
-            neighbors.append(self._node_to_graph_node(nid, ndata))
-
-        # 获取相关的边(中心节点与邻居之间)
-        node_set = {node_id} | set(neighbor_ids)
-        edges: list[GraphEdge] = []
-        for source, target, data in graph.edges(data=True):
-            if source in node_set and target in node_set:
-                edges.append(self._edge_to_graph_edge(source, target, data))
-
-        logger.debug(
-            f"获取邻居子图 | center: {node_id} | "
-            f"neighbors: {len(neighbors)} | edges: {len(edges)}"
-        )
-
-        return NeighborsResponse(
-            center_node=center_node,
-            neighbors=neighbors,
-            edges=edges,
-        )
-
-    def get_stats(self) -> GraphStats:
+        # Cypher 查询：获取中心节点和邻居
+        query = """
+        MATCH (center:Entity {name: $node_id})
+        OPTIONAL MATCH (center)-[r:RELATED_TO]-(neighbor:Entity)
+        RETURN center, collect(DISTINCT neighbor) AS neighbors,
+               collect(DISTINCT r) AS relationships
+        LIMIT $limit
         """
-        获取图谱统计信息
+
+        neighbors_response = None
+
+        def _query_neo4j():
+            nonlocal neighbors_response
+
+            with neo4j_service.driver.session(database=settings.neo4j_database) as session:
+                result = session.run(query, {"node_id": node_id, "limit": limit})
+                record = result.single()
+
+                if not record or not record["center"]:
+                    logger.warning(f"节点不存在 | node_id: {node_id}")
+                    return
+
+                # 中心节点
+                center_props = dict(record["center"])
+                center_node = self._neo4j_node_to_graph_node(center_props)
+
+                # 邻居节点
+                neighbors: list[GraphNode] = []
+                for neighbor in record["neighbors"]:
+                    if neighbor:  # 排除 None
+                        neighbor_props = dict(neighbor)
+                        neighbors.append(self._neo4j_node_to_graph_node(neighbor_props))
+
+                # 边（中心节点与邻居之间）
+                edges: list[GraphEdge] = []
+                # 重新查询边（因为上面的查询没有返回边的源和目标信息）
+                edge_query = """
+                MATCH (center:Entity {name: $node_id})-[r:RELATED_TO]-(neighbor:Entity)
+                RETURN center.name AS center_name, neighbor.name AS neighbor_name,
+                       r.description AS description, r.weight AS weight
+                LIMIT $limit
+                """
+                edge_result = session.run(
+                    edge_query, {"node_id": node_id, "limit": limit}
+                )
+                for edge_record in edge_result:
+                    rel_data = {
+                        "description": edge_record["description"],
+                        "weight": edge_record["weight"],
+                    }
+                    edges.append(
+                        self._neo4j_edge_to_graph_edge(
+                            edge_record["center_name"],
+                            edge_record["neighbor_name"],
+                            rel_data,
+                        )
+                    )
+
+                neighbors_response = NeighborsResponse(
+                    center=center_node,
+                    neighbors=neighbors[:limit],
+                    edges=edges,
+                )
+
+        await asyncio.to_thread(_query_neo4j)
+
+        if neighbors_response:
+            logger.info(
+                f"邻居查询成功 | node_id: {node_id} | "
+                f"邻居数: {len(neighbors_response.neighbors)} | "
+                f"边数: {len(neighbors_response.edges)}"
+            )
+
+        return neighbors_response
+
+    async def get_stats(self) -> GraphStats:
+        """
+        获取图谱统计信息（使用 Neo4j Cypher）
 
         Returns:
             图谱统计信息
         """
-        graph = self._load_graph_if_needed()
+        logger.info("获取图谱统计(Neo4j)")
 
-        # 获取文件最后修改时间
-        last_updated = None
-        if self.graph_file_path.exists():
-            mtime = self.graph_file_path.stat().st_mtime
-            last_updated = datetime.fromtimestamp(mtime)
+        neo4j_service = get_neo4j_service()
 
-        stats = GraphStats(
-            total_nodes=graph.number_of_nodes(),
-            total_edges=graph.number_of_edges(),
-            entity_types=dict(self._entity_type_cache),
-            last_updated=last_updated,
-        )
+        # Cypher 查询：统计节点、边、实体类型分布
+        query = """
+        MATCH (n:Entity)
+        OPTIONAL MATCH ()-[r:RELATED_TO]->()
+        RETURN
+            count(DISTINCT n) AS total_nodes,
+            count(DISTINCT r) AS total_edges,
+            n.entity_type AS entity_type
+        """
 
-        logger.debug(
-            f"获取图谱统计 | 节点: {stats.total_nodes} | "
+        stats = None
+
+        def _query_neo4j():
+            nonlocal stats
+
+            with neo4j_service.driver.session(database=settings.neo4j_database) as session:
+                # 统计总数
+                result = session.run(
+                    "MATCH (n:Entity) "
+                    "OPTIONAL MATCH ()-[r:RELATED_TO]->() "
+                    "RETURN count(DISTINCT n) AS total_nodes, "
+                    "count(DISTINCT r) AS total_edges"
+                )
+                record = result.single()
+                total_nodes = record["total_nodes"]
+                total_edges = record["total_edges"]
+
+                # 统计实体类型分布
+                type_result = session.run(
+                    "MATCH (n:Entity) "
+                    "RETURN n.entity_type AS type, count(n) AS count "
+                    "ORDER BY count DESC"
+                )
+                entity_types = {r["type"]: r["count"] for r in type_result}
+
+                stats = GraphStats(
+                    total_nodes=total_nodes,
+                    total_edges=total_edges,
+                    entity_types=entity_types,
+                    last_updated=datetime.now(),  # Neo4j 不存储文件 mtime，使用当前时间
+                )
+
+        await asyncio.to_thread(_query_neo4j)
+
+        logger.info(
+            f"统计完成 | 节点: {stats.total_nodes} | "
             f"边: {stats.total_edges} | 类型: {len(stats.entity_types)}"
         )
 
@@ -414,6 +493,5 @@ def get_graph_service() -> GraphService:
     """获取图谱服务单例"""
     global _graph_service
     if _graph_service is None:
-        logger.info("首次创建图谱服务实例...")
         _graph_service = GraphService()
     return _graph_service
