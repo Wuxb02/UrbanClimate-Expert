@@ -255,7 +255,9 @@ urban_climate_expert/
 | Phase 2 | Backbone | PDF 解析 + MySQL + SSE API | ✅ 完成 |
 | Phase 3 | Interface | Vue3 前端 + 流式渲染 | ✅ 完成 |
 | Phase 4 | Insight | 知识图谱可视化 | 🚧 开发中 |
-| Phase 5 | Polish | 缓存 + 队列 + Docker 部署 | 📋 计划中 |
+| Phase 5 | Insight | 用户、文档管理 | 🚧 开发中 |
+| Phase 6 | Insight | 安全护栏与幻觉检测 | 🚧 开发中 |
+| Phase 4 | Polish | 缓存 + 队列 + Docker 部署 | 📋 计划中 |
 
 ### 代码规范
 
